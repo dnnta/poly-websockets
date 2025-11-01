@@ -1,7 +1,7 @@
 import { Mutex } from 'async-mutex';
 import _ from 'lodash';
 import { v4 as uuidv4 } from 'uuid';
-import { UserSocketGroup, WebSocketStatus } from '../types/WebSocketSubscriptions';
+import { Auth, UserSocketGroup, WebSocketStatus } from '../types/WebSocketSubscriptions';
 import { logger } from '../logger';
 
 /*
@@ -34,21 +34,8 @@ export class UserRegistry {
     public snapshot(): UserSocketGroup[] {
         return wsGroups.map(group => ({
             ...group,
-            marketIds: new Set(group.marketIds),
+            apiKey: group.auth.key,
         }));
-    }
-
-    /**
-     * Find the first group with capacity to hold new assets.
-     * 
-     * Returns the groupId if found, otherwise null.
-     */
-    public findGroupWithCapacity(newMarketLen: number, maxPerWS: number): string | null {
-        for (const group of wsGroups) {
-            if (group.marketIds.size === 0) continue;
-            if (group.marketIds.size + newMarketLen <= maxPerWS) return group.groupId;
-        }
-        return null;
     }
 
     /**
@@ -56,19 +43,20 @@ export class UserRegistry {
      * 
      * Returns an array of indices.
      */
-    public getGroupIndicesForAsset(marketId: string): number[] {
-        const indices: number[] = [];
+    public getUserGroupIndex(apiKey: string): number {
         for (let i = 0; i < wsGroups.length; i++) {
-            if (wsGroups[i]?.marketIds.has(marketId)) indices.push(i);
+            if (wsGroups[i]?.apiKey === apiKey) {
+                return i;
+            };
         }
-        return indices;
+        return -1;
     }
 
     /**
-     * Check if any group contains the asset.
+     * Check if any group contains subscriptions for the given apiKey.
      */
-    public hasAsset(marketId: string): boolean {
-        return wsGroups.some(group => group.marketIds.has(marketId));
+    public hasGroup(apiKey: string): boolean {
+        return wsGroups.some(group => group.apiKey === apiKey);
     }
 
     /**
@@ -110,70 +98,28 @@ export class UserRegistry {
      * @param maxPerWS - The maximum number of assets per WebSocket group.
      * @returns An array of *new* groupIds that need websocket connections.
      */
-    public async addMarkets(marketIds: string[], maxPerWS: number): Promise<string[]> {
+    public async addUserSubscription(auth: Auth): Promise<string[]> {
         const groupIdsToConnect: string[] = [];
-        let newMarketIds: string[] = []
-
         await this.mutate(groups => {
-            newMarketIds = marketIds.filter(id => !groups.some(g => g.marketIds.has(id)));
-            if (newMarketIds.length === 0) return;
-
-            const existingGroupId = this.findGroupWithCapacity(newMarketIds.length, maxPerWS);
-
-            /*
-                If no existing group with capacity is found, create new groups.
-            */
-            if (existingGroupId === null) {
-                const chunks = _.chunk(newMarketIds, maxPerWS);
-                for (const chunk of chunks) {
-                    const groupId = uuidv4();
-                    groups.push(
-                        { 
-                            groupId,
-                            assetIds: new Set(),
-                            marketIds: new Set(chunk), 
-                            wsClient: null, 
-                            status: WebSocketStatus.PENDING 
-                        }
-                    );
-                    groupIdsToConnect.push(groupId);
-                }
-
-            /*
-                If an existing group with capacity is found, update the group.
-            */
-            } else {
-                const existingGroup = groups.find(g => g.groupId === existingGroupId);
-                if (!existingGroup) {
-                    // Should never happen
-                    throw new Error(`Group with capacity not found for ${newMarketIds.join(', ')}`);
-                }
-
-                const updatedMarketIds = new Set([...existingGroup.marketIds, ...newMarketIds]);
-
-                // Mark old group ready for cleanup
-                existingGroup.assetIds = new Set();
-                existingGroup.status = WebSocketStatus.CLEANUP;
-
+            const existingGroupId = this.hasGroup(auth.key);
+            if (!existingGroupId) {
                 const groupId = uuidv4();
                 groups.push(
                     { 
-                        groupId, 
-                        assetIds: new Set(), 
-                        marketIds: updatedMarketIds,
+                        groupId,
+                        apiKey: auth.key,
+                        auth: auth,
                         wsClient: null, 
                         status: WebSocketStatus.PENDING 
                     }
                 );
                 groupIdsToConnect.push(groupId);
+            } else {
+                logger.warn({
+                    message: `User webSocket with apiKey [${auth.key}] already exists. ignoring...`,
+                });
             }
         });
-
-        if (newMarketIds.length > 0) {
-            logger.info({
-                message: `Added ${newMarketIds.length} new user market(s)`
-            })
-        }
         return groupIdsToConnect;
     }
 
@@ -185,25 +131,14 @@ export class UserRegistry {
      * 
      * Returns the list of assetIds that were removed.
      */
-    public async removeMarkets(marketIds: string[]): Promise<string[]> {
-        const removedMarketIds: string[] = [];
+    public async removeUserSubscriptions(apiKey: string): Promise<void> {
         await this.mutate(groups => {
-            groups.forEach(group => {
-                if (group.marketIds.size === 0) return;
-
-                marketIds.forEach(id => {
-                    if (group.marketIds.delete(id)) {
-                        removedMarketIds.push(id)
-                    }
-                });
-            });
+            const group = groups.find(g => g.apiKey === apiKey);
+            if (!group) {
+                return;
+            }
+            this.disconnectGroup(group);
         });
-        if (removedMarketIds.length > 0) {
-            logger.info({
-                message: `Removed ${removedMarketIds.length} user market(s)`
-            })
-        }
-        return removedMarketIds;
     }
 
     /**
@@ -214,11 +149,10 @@ export class UserRegistry {
         group.wsClient = null;
 
         logger.info({
-            message: 'Disconnected User WebSocket market group',
+            message: 'Disconnected User WebSocket group',
             groupId: group.groupId,
-            marketIds: Array.from(group.marketIds),
+            apiKey: group.apiKey,
         });
-
     };
     /**
      * Check status of groups and reconnect or cleanup as needed.
@@ -235,12 +169,7 @@ export class UserRegistry {
         await this.mutate(groups => {
             const groupsToRemove = new Set<string>();
 
-            for (const group of groups) {
-                if (group.marketIds.size === 0) {
-                    groupsToRemove.add(group.groupId);
-                    continue;
-                }
-
+            for (const group of groups) {            
                 if (group.status === WebSocketStatus.ALIVE) {
                     continue;
                 }
@@ -251,7 +180,6 @@ export class UserRegistry {
                 }
                 if (group.status === WebSocketStatus.CLEANUP) {
                     groupsToRemove.add(group.groupId);
-                    group.marketIds = new Set();
                     continue;
                 }
 

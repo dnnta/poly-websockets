@@ -1,6 +1,6 @@
 {
   "name": "@ultralumao/poly-websockets",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Plug-and-play Polymarket WebSocket price alerts",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

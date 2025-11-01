@@ -13,20 +13,22 @@ npm install @ultralumao/poly-websockets
 ## Features
 
 - 📊 **Real-time Market Updates**: Get `book` , `price_change`, `tick_size_change` and `last_trade_price` real-time market events from Polymarket WSS
-- 👤 **User WebSocket Support**: Subscribe to your own trade and order events via Polymarket User WebSocket
+- 👤 **Multi-User WebSocket Support**: Subscribe to multiple users' trade and order events via Polymarket User WebSocket, with one WebSocket connection per user
+- 🔐 **Flexible User Channel Subscription**: User WebSocket handlers can be set separately and independently from market handlers
 - 🎯 **Derived Future Price Event**: Implements Polymarket's [price calculation logic](https://docs.polymarket.com/polymarket-learn/trading/how-are-prices-calculated#future-price) (midpoint vs last trade price based on spread)
-- 🔗 **Group Management**: Efficiently manages multiple asset subscriptions across connection groups **without losing events** when subscribing / unsubscribing assets.
+- 🔗 **Group Management**: Efficiently manages multiple asset subscriptions across connection groups **without losing events** when subscribing / unsubscribing assets
 - 🔄 **Automatic Connection Management**: Handles WebSocket connections, reconnections, and cleanup for grouped assetId (i.e. clobTokenId) subscriptions
 - 🚦 **Rate Limiting**: Built-in rate limiting to respect Polymarket API limits
 - 💪 **TypeScript Support**: Full TypeScript definitions for all events and handlers
 
 ## Quick Start
 
+### Market Data Subscriptions
+
 ```typescript
 import {
   WSSubscriptionManager,
-  WebSocketHandlers,
-  UserSocketHandlers
+  WebSocketHandlers
   } from '@ultralumao/poly-websockets';
 
 // Market data handlers
@@ -46,41 +48,73 @@ const marketHandlers: WebSocketHandlers = {
   }
 };
 
-// User socket handlers (for trade and order events)
-const userHandlers: UserSocketHandlers = {
-  onTrade: async (events: TradeEvent[]) => {
-    for (const event of events) {
-      console.log('trade event', JSON.stringify(event, null, 2))
-    }
-  },
-  onOrder: async (events: OrderEvent[]) => {
-    for (const event of events) {
-      console.log('order event', JSON.stringify(event, null, 2))
-    }
-  },
-  onError: async (error: Error) => {
-    console.error('User WebSocket error:', error);
-  }
-};
-
-// Create the subscription manager
-const manager = new WSSubscriptionManager(marketHandlers, userHandlers, {
-  auth: {
-    key: 'your-api-key',
-    secret: 'your-api-secret',
-    passphrase: 'your-api-passphrase'
-  }
-});
+// Create the subscription manager (only market handlers required)
+const manager = new WSSubscriptionManager(marketHandlers);
 
 // Subscribe to market assets
 await manager.addSubscriptions(['asset-id-1', 'asset-id-2']);
 
-// Subscribe to user markets (requires authentication)
-await manager.addUserMarkets(['market-id-1', 'market-id-2']);
-
 // Remove subscriptions
 await manager.removeSubscriptions(['asset-id-1']);
-await manager.removeUserMarkets(['market-id-1']);
+```
+
+### User WebSocket Subscriptions (Multi-User Support)
+
+```typescript
+import {
+  WSSubscriptionManager,
+  WebSocketHandlers,
+  UserSocketHandlers
+  } from '@ultralumao/poly-websockets';
+
+// Market data handlers
+const marketHandlers: WebSocketHandlers = { /* ... */ };
+
+// Create the subscription manager
+const manager = new WSSubscriptionManager(marketHandlers);
+
+// Set user handlers (can be done separately)
+const userHandlers: UserSocketHandlers = {
+  onTrade: async (apiKey: string, events: TradeEvent[]) => {
+    console.log(`Trade events for user ${apiKey}:`, events);
+    for (const event of events) {
+      console.log('trade event', JSON.stringify(event, null, 2))
+    }
+  },
+  onOrder: async (apiKey: string, events: OrderEvent[]) => {
+    console.log(`Order events for user ${apiKey}:`, events);
+    for (const event of events) {
+      console.log('order event', JSON.stringify(event, null, 2))
+    }
+  },
+  onWSOpen: async (apiKey: string) => {
+    console.log(`User WebSocket connected for ${apiKey}`);
+  },
+  onWSClose: async (apiKey: string, code: number, reason: string) => {
+    console.log(`User WebSocket closed for ${apiKey}:`, code, reason);
+  },
+  onError: async (apiKey: string, error: Error) => {
+    console.error(`User WebSocket error for ${apiKey}:`, error);
+  }
+};
+
+manager.setUserHandlers(userHandlers);
+
+// Connect multiple users (each user gets their own WebSocket connection)
+await manager.connectUserSocket({
+  key: 'user1-api-key',
+  secret: 'user1-api-secret',
+  passphrase: 'user1-api-passphrase'
+});
+
+await manager.connectUserSocket({
+  key: 'user2-api-key',
+  secret: 'user2-api-secret',
+  passphrase: 'user2-api-passphrase'
+});
+
+// Disconnect a specific user
+await manager.disconnectUserSocket('user1-api-key');
 
 // Clear all subscriptions and connections
 await manager.clearState();
@@ -97,26 +131,18 @@ The main class that manages WebSocket connections and subscriptions.
 ```typescript
 new WSSubscriptionManager(
   marketHandlers: WebSocketHandlers, 
-  userHandlers: UserSocketHandlers, 
   options?: SubscriptionManagerOptions
 )
 ```
 
 **Parameters:**
 - `marketHandlers` - Event handlers for market WebSocket events (book, price changes, etc.)
-- `userHandlers` - Event handlers for user WebSocket events (trades, orders)
 - `options` - Optional configuration object:
   - `maxMarketsPerWS?: number` - Maximum assets/markets per WebSocket connection (default: 100)
   - `reconnectAndCleanupIntervalMs?: number` - Interval for reconnection attempts (default: 10s)
   - `burstLimiter?: Bottleneck` - Custom rate limiter instance. If none is provided, one will be created and used internally in the component.
-  - `auth?: Auth` - API credentials for User WebSocket authentication:
-    ```typescript
-    {
-      key: string;        // API key
-      secret: string;     // API secret
-      passphrase: string; // API passphrase
-    }
-    ```
+
+**Note:** User WebSocket handlers and authentication are now set separately via `setUserHandlers()` and `connectUserSocket()` methods, allowing flexible multi-user support.
 
 #### Methods
 
@@ -131,19 +157,38 @@ Adds new asset subscriptions. The manager will:
 
 Removes asset subscriptions. **Connections are kept alive to avoid missing events**, and unused groups are cleaned up during the next reconnection cycle.
 
-##### `addUserMarkets(marketIds: string[]): Promise<void>`
+##### `setUserHandlers(userHandlers: UserSocketHandlers): void`
 
-Adds user market subscriptions for trade and order events. Requires authentication credentials in options.
+Sets the user WebSocket event handlers. This can be called separately from constructor initialization, allowing you to enable user WebSocket functionality when needed.
 
-##### `removeUserMarkets(marketIds: string[]): Promise<void>`
+##### `connectUserSocket(auth: Auth): Promise<void>`
 
-Removes user market subscriptions.
+Connects a user WebSocket for a specific API key. Each user gets their own WebSocket connection (one user = one group). Supports connecting multiple users simultaneously.
+
+**Parameters:**
+- `auth` - API credentials for the user:
+  ```typescript
+  {
+    key: string;        // API key (used to identify the user)
+    secret: string;     // API secret
+    passphrase: string; // API passphrase
+  }
+  ```
+
+**Note:** `setUserHandlers()` must be called before connecting any user sockets.
+
+##### `disconnectUserSocket(apiKey: string): Promise<void>`
+
+Disconnects the WebSocket for a specific user by their API key.
+
+**Parameters:**
+- `apiKey` - The API key of the user to disconnect
 
 ##### `clearState(): Promise<void>`
 
 Clears all subscriptions and state:
 - Removes all asset subscriptions
-- Removes all user market subscriptions
+- Disconnects all user WebSocket connections
 - Closes all WebSocket connections
 - Clears the internal order book cache
 
@@ -171,18 +216,19 @@ interface WebSocketHandlers {
 
 ### UserSocketHandlers
 
-Interface defining event handlers for user WebSocket events (trades and orders).
+Interface defining event handlers for user WebSocket events (trades and orders). All handlers receive the `apiKey` as the first parameter to identify which user the event belongs to, enabling multi-user support.
 
 ```typescript
 interface UserSocketHandlers {
   // User-specific events
-  onTrade?: (events: TradeEvent[]) => Promise<void>;
-  onOrder?: (events: OrderEvent[]) => Promise<void>;
+  // apiKey is provided to identify which user's events these are
+  onTrade?: (apiKey: string, events: TradeEvent[]) => Promise<void>;
+  onOrder?: (apiKey: string, events: OrderEvent[]) => Promise<void>;
   
   // Connection lifecycle events
-  onWSOpen?: (groupId: string, marketIds: string[]) => Promise<void>;
-  onWSClose?: (groupId: string, code: number, reason: string) => Promise<void>;
-  onError?: (error: Error) => Promise<void>;
+  onWSOpen?: (apiKey: string) => Promise<void>;
+  onWSClose?: (apiKey: string, code: number, reason: string) => Promise<void>;
+  onError?: (apiKey: string, error: Error) => Promise<void>;
 }
 ```
 
@@ -228,11 +274,14 @@ const customLimiter = new Bottleneck({
 });
 
 const marketHandlers: WebSocketHandlers = { /* ... */ };
-const userHandlers: UserSocketHandlers = { /* ... */ };
 
-const manager = new WSSubscriptionManager(marketHandlers, userHandlers, {
+const manager = new WSSubscriptionManager(marketHandlers, {
   burstLimiter: customLimiter
 });
+
+// User handlers can be set separately
+const userHandlers: UserSocketHandlers = { /* ... */ };
+manager.setUserHandlers(userHandlers);
 ```
 
 ## Examples
@@ -258,10 +307,12 @@ This package is a fork of [nevuamarkets/poly-websockets](https://github.com/nevu
 ### Differences from Original
 
 - ✅ Added User WebSocket support for trade and order events
-- ✅ Added `addUserMarkets()` and `removeUserMarkets()` methods
-- ✅ Enhanced `WSSubscriptionManager` constructor to accept both market and user handlers
+- ✅ **Flexible User Channel Subscription**: User handlers can be set separately via `setUserHandlers()`, independent of market handlers
+- ✅ **Multi-User Support**: Each user gets their own WebSocket connection (one user = one group), allowing multiple users to be connected simultaneously
+- ✅ **Separate User Connection Management**: `connectUserSocket(auth)` and `disconnectUserSocket(apiKey)` methods for per-user connection management
+- ✅ **User Identification in Handlers**: All `UserSocketHandlers` callbacks receive `apiKey` as the first parameter to identify which user the event belongs to
 - ✅ Added `UserSocketHandlers` interface for user-specific events
-- ✅ Requires authentication credentials for User WebSocket functionality
+- ✅ Requires authentication credentials per user when connecting user WebSockets
 
 ### Original Repository
 

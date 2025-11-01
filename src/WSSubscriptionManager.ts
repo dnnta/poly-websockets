@@ -41,11 +41,10 @@ class WSSubscriptionManager {
     private reconnectAndCleanupIntervalMs: number;
     private maxMarketsPerWS: number;
 
-    private userHandlers: UserSocketHandlers;
+    private userHandlers?: UserSocketHandlers;
     private userRegistry: UserRegistry;
-    private auth: Auth;
 
-    constructor(marketHandlers: WebSocketHandlers, userHandlers: UserSocketHandlers, options?: SubscriptionManagerOptions) {
+    constructor(marketHandlers: WebSocketHandlers, options?: SubscriptionManagerOptions) {
         this.groupRegistry = new GroupRegistry();
         this.bookCache = new OrderBookCache();
         this.userRegistry = new UserRegistry();
@@ -55,12 +54,6 @@ class WSSubscriptionManager {
             reservoirRefreshInterval: ms('1s'),
             maxConcurrent: BURST_LIMIT_PER_SECOND
         });
-
-        this.auth = options?.auth || {
-            key: '',
-            secret: '',
-            passphrase: '',
-        };
 
         this.reconnectAndCleanupIntervalMs = options?.reconnectAndCleanupIntervalMs || DEFAULT_RECONNECT_AND_CLEANUP_INTERVAL_MS;
         this.maxMarketsPerWS = options?.maxMarketsPerWS || DEFAULT_MAX_MARKETS_PER_WS;
@@ -86,18 +79,6 @@ class WSSubscriptionManager {
             onError: marketHandlers.onError
         };
 
-        this.userHandlers = {
-            onTrade: async (events: TradeEvent[]) => {
-                await this.actOnSubscribedUserEvents(events, userHandlers.onTrade);
-            },
-            onOrder: async (events: OrderEvent[]) => {
-                await this.actOnSubscribedUserEvents(events, userHandlers.onOrder);
-            },
-            onWSClose: userHandlers.onWSClose,
-            onWSOpen: userHandlers.onWSOpen,
-            onError: userHandlers.onError
-        };
-
         this.burstLimiter.on('error', (err: Error) => {
             this.handlers.onError?.(err);
         });
@@ -106,6 +87,34 @@ class WSSubscriptionManager {
         setInterval(() => {
             this.reconnectAndCleanupGroups();
         }, this.reconnectAndCleanupIntervalMs);
+    }
+
+    public setUserHandlers(userHandlers: UserSocketHandlers) {
+        this.userHandlers = {
+            onTrade: async (userKey: string, events: TradeEvent[]) => {
+                await this.actOnSubscribedUserEvents(userKey, events, userHandlers.onTrade);
+            },
+            onOrder: async (userKey: string, events: OrderEvent[]) => {
+                await this.actOnSubscribedUserEvents(userKey, events, userHandlers.onOrder);
+            },
+            onWSClose: async (userKey: string, code: number, reason: string) => {
+                userHandlers.onWSClose?.(userKey, code, reason);
+            },
+            onWSOpen: userHandlers.onWSOpen,
+            onError: userHandlers.onError
+        };
+    }
+
+    public async connectUserSocket(auth: Auth) {
+        try {
+            const groupIdsToConnect = await this.userRegistry.addUserSubscription(auth);
+            for (const groupId of groupIdsToConnect) {
+                await this.createUserWebSocketClient(groupId, this.userHandlers ?? null);
+            }
+        } catch (error) {
+            const errMsg = `Error connecting user WebSocket: ${error instanceof Error ? error.message : String(error)}`;
+            await this.userHandlers?.onError?.(auth.key, new Error(errMsg));
+        }
     }
 
     /*
@@ -182,14 +191,14 @@ class WSSubscriptionManager {
         await action?.(events);
     }
 
-    private async actOnSubscribedUserEvents<T extends UserWSEvent>(events: T[], action?: (events: T[]) => Promise<void>) {
+    private async actOnSubscribedUserEvents<T extends UserWSEvent>(userKey: string, events: T[], action?: (userKey: string, events: T[]) => Promise<void>) {
         events = _.filter(events, (event: T) => {
             if (isTradeEvent(event) || isOrderEvent(event)) {
                 return true;
             }
             return false;
         });
-        await action?.(events);
+        await action?.(userKey, events);
     }
 
     /*  
@@ -211,18 +220,6 @@ class WSSubscriptionManager {
         }
     }
 
-    public async addUserMarkets(marketIdsToAdd: string[]) {
-        try {
-            const groupIdsToConnect = await this.userRegistry.addMarkets(marketIdsToAdd, this.maxMarketsPerWS);
-            for (const groupId of groupIdsToConnect) {
-                await this.createUserWebSocketClient(groupId, this.userHandlers);
-            }
-        } catch (error) {
-            const errMsg = `Error adding user subscriptions: ${error instanceof Error ? error.message : String(error)}`;
-            await this.userHandlers.onError?.(new Error(errMsg));
-        }
-    }
-
     /*  
         Edits wsGroups: Removes subscriptions.
         The group will use the updated subscriptions when it reconnects.
@@ -237,12 +234,12 @@ class WSSubscriptionManager {
         }
     }
 
-    public async removeUserMarkets(marketIdsToRemove: string[]) {
+    public async disconnectUserSocket(apiKey: string) {
         try {
-            await this.userRegistry.removeMarkets(marketIdsToRemove);
+            await this.userRegistry.removeUserSubscriptions(apiKey);
         } catch (error) {
             const errMsg = `Error removing subscriptions: ${error instanceof Error ? error.message : String(error)}`;
-            await this.userHandlers.onError?.(new Error(errMsg));
+            await this.userHandlers?.onError?.(apiKey, new Error(errMsg));
         }
     }
 
@@ -259,11 +256,10 @@ class WSSubscriptionManager {
             for (const groupId of reconnectIds) {
                 await this.createWebSocketClient(groupId, this.handlers);
             }
-            for (const groupId of userReconnectIds) {
-                console.log("================================================");
-                console.log(groupId);
-                console.log("================================================");
-                await this.createUserWebSocketClient(groupId, this.userHandlers);
+            if (this.userHandlers) {
+                for (const groupId of userReconnectIds) {
+                    await this.createUserWebSocketClient(groupId, this.userHandlers);
+                }
             }
         } catch (err) {
             await this.handlers.onError?.(err as Error);
@@ -290,19 +286,19 @@ class WSSubscriptionManager {
         }
     }   
 
-    private async createUserWebSocketClient(groupId: string, handlers: UserSocketHandlers) {
+    private async createUserWebSocketClient(groupId: string, handlers: UserSocketHandlers | null) {
         const group = this.userRegistry.findGroupById(groupId);
         if (!group) {
-            await handlers.onError?.(new Error(`User group ${groupId} not found in registry`));
+            await handlers?.onError?.('', new Error(`User group ${groupId} not found in registry`));
             return;
         }
     
-        const userSocket = new UserSocket(group, this.burstLimiter, handlers, this.auth);
+        const userSocket = new UserSocket(group, this.burstLimiter, handlers);
         try {
             await userSocket.connect();
         } catch (error) {
-            const errorMessage = `Error creating User WebSocket client for group ${groupId}: ${error instanceof Error ? error.message : String(error)}`;
-            await handlers.onError?.(new Error(errorMessage));
+            const errorMessage = `Error creating User WebSocket client for key ${group.apiKey}: ${error instanceof Error ? error.message : String(error)}`;
+            await handlers?.onError?.(group.apiKey, new Error(errorMessage));
         }
     }
 }

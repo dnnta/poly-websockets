@@ -117,15 +117,14 @@ export type OrderEvent = {
 };
 
 export type UserSocketHandlers = {
-
-    onTrade?: (events: TradeEvent[]) => Promise<void>;
+    onTrade?: (apiKey: string, events: TradeEvent[]) => Promise<void>;
     
-    onOrder?: (events: OrderEvent[]) => Promise<void>;
+    onOrder?: (apiKey: string, events: OrderEvent[]) => Promise<void>;
     
     // Error handling
-    onError?: (error: Error) => Promise<void>;
-    onWSClose?: (groupId: string, code: number, reason: string) => Promise<void>;
-    onWSOpen?: (groupId: string, marketIds: string[]) => Promise<void>;
+    onError?: (apiKey: string, error: Error) => Promise<void>;
+    onWSClose?: (apiKey: string, code: number, reason: string) => Promise<void>;
+    onWSOpen?: (apiKey: string) => Promise<void>;
 }
 
 export type UserWSEvent = TradeEvent | OrderEvent;

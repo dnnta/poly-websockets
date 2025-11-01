@@ -21,8 +21,12 @@ export type WebSocketGroup = {
     status: WebSocketStatus;
 };
 
-export type UserSocketGroup = WebSocketGroup & {
-    marketIds: Set<string>;
+export type UserSocketGroup = {
+    groupId: string;
+    apiKey: string;
+    wsClient: WebSocket | null;
+    status: WebSocketStatus;
+    auth: Auth;
 };
 
 export type SubscriptionManagerOptions = {
