@@ -1,6 +1,7 @@
 /// <reference types="vitest" />
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { WSSubscriptionManager, WebSocketHandlers } from '../src/WSSubscriptionManager';
+import { UserSocketHandlers } from '../src/types/PolymarketUserSocket';
 import { GroupRegistry } from '../src/modules/GroupRegistry';
 import { OrderBookCache } from '../src/modules/OrderBookCache';
 import { GroupSocket } from '../src/modules/GroupSocket';
@@ -28,6 +29,7 @@ const MockedBottleneck = vi.mocked(Bottleneck);
 describe('WSSubscriptionManager', () => {
     let manager: WSSubscriptionManager;
     let mockHandlers: WebSocketHandlers;
+    let mockUserHandlers: UserSocketHandlers;
     let mockGroupRegistry: any;
     let mockBookCache: any;
     let mockBottleneck: any;
@@ -81,6 +83,14 @@ describe('WSSubscriptionManager', () => {
             onError: vi.fn()
         };
 
+        mockUserHandlers = {
+            onTrade: vi.fn(),
+            onOrder: vi.fn(),
+            onWSOpen: vi.fn(),
+            onWSClose: vi.fn(),
+            onError: vi.fn()
+        };
+
         // Setup GroupRegistry mock
         mockGroupRegistry = {
             addAssets: vi.fn().mockResolvedValue([]),
@@ -116,7 +126,7 @@ describe('WSSubscriptionManager', () => {
 
         MockedGroupSocket.mockImplementation(() => mockGroupSocket);
 
-        manager = new WSSubscriptionManager(mockHandlers);
+        manager = new WSSubscriptionManager(mockHandlers, mockUserHandlers);
     });
 
     afterEach(() => {
@@ -137,7 +147,7 @@ describe('WSSubscriptionManager', () => {
 
         it('should use custom bottleneck if provided in options', () => {
             const customBottleneck = new Bottleneck();
-            new WSSubscriptionManager(mockHandlers, { burstLimiter: customBottleneck });
+            new WSSubscriptionManager(mockHandlers, mockUserHandlers, { burstLimiter: customBottleneck });
 
             // Should not create a new bottleneck when custom one is provided
             // 1 for the constructor, 1 during the connect call
@@ -296,7 +306,7 @@ describe('WSSubscriptionManager', () => {
                     });
 
                 // Create a manager with handlers that we can access
-                const testManager = new WSSubscriptionManager(mockHandlers);
+                const testManager = new WSSubscriptionManager(mockHandlers, mockUserHandlers);
                 
                 // Access the private method through the handlers
                 await (testManager as any).handlers.onBook(events);
@@ -312,7 +322,7 @@ describe('WSSubscriptionManager', () => {
 
                 mockGroupRegistry.getGroupIndicesForAsset.mockReturnValue([]); // No subscriptions
 
-                const testManager = new WSSubscriptionManager(mockHandlers);
+                const testManager = new WSSubscriptionManager(mockHandlers, mockUserHandlers);
                 await (testManager as any).handlers.onBook(events);
 
                 expect(mockHandlers.onBook).toHaveBeenCalledWith([]);
@@ -356,7 +366,7 @@ describe('WSSubscriptionManager', () => {
 
             mockGroupRegistry.getGroupIndicesForAsset.mockReturnValue([0]);
 
-            const testManager = new WSSubscriptionManager(mockHandlers);
+            const testManager = new WSSubscriptionManager(mockHandlers, mockUserHandlers);
 
             await (testManager as any).handlers.onBook([bookEvent]);
             await (testManager as any).handlers.onPriceChange([priceChangeEvent]);
@@ -387,9 +397,10 @@ describe('WSSubscriptionManager', () => {
             
             // Wait for the async operations in the interval callback
             await vi.waitFor(() => {
-                expect(mockGroupRegistry.getGroupsToReconnectAndCleanup).toHaveBeenCalled();
-            });
+                expect(MockedGroupSocket).toHaveBeenCalledTimes(2);
+            }, { timeout: 2000 });
 
+            expect(mockGroupRegistry.getGroupsToReconnectAndCleanup).toHaveBeenCalled();
             expect(MockedGroupSocket).toHaveBeenCalledTimes(2);
             expect(mockGroupSocket.connect).toHaveBeenCalledTimes(2);
         });
@@ -430,7 +441,7 @@ describe('WSSubscriptionManager', () => {
 
     describe('handler delegation', () => {
         it('should delegate onWSClose to user handlers', async () => {
-            const testManager = new WSSubscriptionManager(mockHandlers);
+            const testManager = new WSSubscriptionManager(mockHandlers, mockUserHandlers);
             
             await (testManager as any).handlers.onWSClose('group1', ['asset1']);
 
@@ -438,7 +449,7 @@ describe('WSSubscriptionManager', () => {
         });
 
         it('should delegate onWSOpen to user handlers', async () => {
-            const testManager = new WSSubscriptionManager(mockHandlers);
+            const testManager = new WSSubscriptionManager(mockHandlers, mockUserHandlers);
             
             await (testManager as any).handlers.onWSOpen('group1', ['asset1']);
 
@@ -447,7 +458,7 @@ describe('WSSubscriptionManager', () => {
 
         it('should delegate onError to user handlers', async () => {
             const error = new Error('Test error');
-            const testManager = new WSSubscriptionManager(mockHandlers);
+            const testManager = new WSSubscriptionManager(mockHandlers, mockUserHandlers);
             
             await (testManager as any).handlers.onError(error);
 

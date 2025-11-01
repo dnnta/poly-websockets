@@ -2,17 +2,18 @@
 
 A TypeScript library for **real-time Polymarket market price alerts** over **Websocket** with **automatic reconnections** and **easy subscription management**.
 
-Powering [Nevua Markets](https://nevua.markets)
+> **Note**: This is a fork of [nevuamarkets/poly-websockets](https://github.com/nevuamarkets/poly-websockets) with additional features including User WebSocket support for trade and order events.
 
 ## Installation
 
 ```bash
-npm install @nevuamarkets/poly-websockets
+npm install @ultralumao/poly-websockets
 ```
 
 ## Features
 
 - 📊 **Real-time Market Updates**: Get `book` , `price_change`, `tick_size_change` and `last_trade_price` real-time market events from Polymarket WSS
+- 👤 **User WebSocket Support**: Subscribe to your own trade and order events via Polymarket User WebSocket
 - 🎯 **Derived Future Price Event**: Implements Polymarket's [price calculation logic](https://docs.polymarket.com/polymarket-learn/trading/how-are-prices-calculated#future-price) (midpoint vs last trade price based on spread)
 - 🔗 **Group Management**: Efficiently manages multiple asset subscriptions across connection groups **without losing events** when subscribing / unsubscribing assets.
 - 🔄 **Automatic Connection Management**: Handles WebSocket connections, reconnections, and cleanup for grouped assetId (i.e. clobTokenId) subscriptions
@@ -24,11 +25,12 @@ npm install @nevuamarkets/poly-websockets
 ```typescript
 import {
   WSSubscriptionManager,
-  WebSocketHandlers
-  } from '@nevuamarkets/poly-websockets';
+  WebSocketHandlers,
+  UserSocketHandlers
+  } from '@ultralumao/poly-websockets';
 
-// Create the subscription manager with your own handlers
-const manager = new WSSubscriptionManager({
+// Market data handlers
+const marketHandlers: WebSocketHandlers = {
   onBook: async (events: BookEvent[]) => {
     for (const event of events) {
       console.log('book event', JSON.stringify(event, null, 2))
@@ -38,14 +40,47 @@ const manager = new WSSubscriptionManager({
     for (const event of events) {
       console.log('price change event', JSON.stringify(event, null, 2))
     }
+  },
+  onError: async (error: Error) => {
+    console.error('Market WebSocket error:', error);
+  }
+};
+
+// User socket handlers (for trade and order events)
+const userHandlers: UserSocketHandlers = {
+  onTrade: async (events: TradeEvent[]) => {
+    for (const event of events) {
+      console.log('trade event', JSON.stringify(event, null, 2))
+    }
+  },
+  onOrder: async (events: OrderEvent[]) => {
+    for (const event of events) {
+      console.log('order event', JSON.stringify(event, null, 2))
+    }
+  },
+  onError: async (error: Error) => {
+    console.error('User WebSocket error:', error);
+  }
+};
+
+// Create the subscription manager
+const manager = new WSSubscriptionManager(marketHandlers, userHandlers, {
+  auth: {
+    key: 'your-api-key',
+    secret: 'your-api-secret',
+    passphrase: 'your-api-passphrase'
   }
 });
 
-// Subscribe to assets
+// Subscribe to market assets
 await manager.addSubscriptions(['asset-id-1', 'asset-id-2']);
+
+// Subscribe to user markets (requires authentication)
+await manager.addUserMarkets(['market-id-1', 'market-id-2']);
 
 // Remove subscriptions
 await manager.removeSubscriptions(['asset-id-1']);
+await manager.removeUserMarkets(['market-id-1']);
 
 // Clear all subscriptions and connections
 await manager.clearState();
@@ -60,15 +95,28 @@ The main class that manages WebSocket connections and subscriptions.
 #### Constructor
 
 ```typescript
-new WSSubscriptionManager(handlers: WebSocketHandlers, options?: SubscriptionManagerOptions)
+new WSSubscriptionManager(
+  marketHandlers: WebSocketHandlers, 
+  userHandlers: UserSocketHandlers, 
+  options?: SubscriptionManagerOptions
+)
 ```
 
 **Parameters:**
-- `handlers` - Event handlers for different WebSocket events
+- `marketHandlers` - Event handlers for market WebSocket events (book, price changes, etc.)
+- `userHandlers` - Event handlers for user WebSocket events (trades, orders)
 - `options` - Optional configuration object:
-  - `maxMarketsPerWS?: number` - Maximum assets per WebSocket connection (default: 100)
+  - `maxMarketsPerWS?: number` - Maximum assets/markets per WebSocket connection (default: 100)
   - `reconnectAndCleanupIntervalMs?: number` - Interval for reconnection attempts (default: 10s)
   - `burstLimiter?: Bottleneck` - Custom rate limiter instance. If none is provided, one will be created and used internally in the component.
+  - `auth?: Auth` - API credentials for User WebSocket authentication:
+    ```typescript
+    {
+      key: string;        // API key
+      secret: string;     // API secret
+      passphrase: string; // API passphrase
+    }
+    ```
 
 #### Methods
 
@@ -83,16 +131,25 @@ Adds new asset subscriptions. The manager will:
 
 Removes asset subscriptions. **Connections are kept alive to avoid missing events**, and unused groups are cleaned up during the next reconnection cycle.
 
+##### `addUserMarkets(marketIds: string[]): Promise<void>`
+
+Adds user market subscriptions for trade and order events. Requires authentication credentials in options.
+
+##### `removeUserMarkets(marketIds: string[]): Promise<void>`
+
+Removes user market subscriptions.
+
 ##### `clearState(): Promise<void>`
 
 Clears all subscriptions and state:
 - Removes all asset subscriptions
+- Removes all user market subscriptions
 - Closes all WebSocket connections
 - Clears the internal order book cache
 
 ### WebSocketHandlers
 
-Interface defining event handlers for different WebSocket events.
+Interface defining event handlers for market WebSocket events.
 
 ```typescript
 interface WebSocketHandlers {
@@ -107,6 +164,23 @@ interface WebSocketHandlers {
   
   // Connection lifecycle events
   onWSOpen?: (groupId: string, assetIds: string[]) => Promise<void>;
+  onWSClose?: (groupId: string, code: number, reason: string) => Promise<void>;
+  onError?: (error: Error) => Promise<void>;
+}
+```
+
+### UserSocketHandlers
+
+Interface defining event handlers for user WebSocket events (trades and orders).
+
+```typescript
+interface UserSocketHandlers {
+  // User-specific events
+  onTrade?: (events: TradeEvent[]) => Promise<void>;
+  onOrder?: (events: OrderEvent[]) => Promise<void>;
+  
+  // Connection lifecycle events
+  onWSOpen?: (groupId: string, marketIds: string[]) => Promise<void>;
   onWSClose?: (groupId: string, code: number, reason: string) => Promise<void>;
   onError?: (error: Error) => Promise<void>;
 }
@@ -131,6 +205,16 @@ interface WebSocketHandlers {
 - Uses midpoint when spread <= $0.10, otherwise uses last trade price
 - Includes full order book context
 
+**TradeEvent**
+- Represents a trade event from Polymarket User WebSocket
+- Contains trade details including maker orders, price, size, and status
+- Requires User WebSocket authentication
+
+**OrderEvent**
+- Represents an order event from Polymarket User WebSocket
+- Tracks order lifecycle: placement, updates, and cancellations
+- Requires User WebSocket authentication
+
 ### Custom Rate Limiting
 
 ```typescript
@@ -143,7 +227,10 @@ const customLimiter = new Bottleneck({
   maxConcurrent: 10
 });
 
-const manager = new WSSubscriptionManager(handlers, {
+const marketHandlers: WebSocketHandlers = { /* ... */ };
+const userHandlers: UserSocketHandlers = { /* ... */ };
+
+const manager = new WSSubscriptionManager(marketHandlers, userHandlers, {
   burstLimiter: customLimiter
 });
 ```
@@ -164,9 +251,27 @@ Respects Polymarket's API rate limits:
 - Default: 5 requests per second burst limit
 - Configurable through custom Bottleneck instances
 
+## Fork Information
+
+This package is a fork of [nevuamarkets/poly-websockets](https://github.com/nevuamarkets/poly-websockets).
+
+### Differences from Original
+
+- ✅ Added User WebSocket support for trade and order events
+- ✅ Added `addUserMarkets()` and `removeUserMarkets()` methods
+- ✅ Enhanced `WSSubscriptionManager` constructor to accept both market and user handlers
+- ✅ Added `UserSocketHandlers` interface for user-specific events
+- ✅ Requires authentication credentials for User WebSocket functionality
+
+### Original Repository
+
+- Repository: https://github.com/nevuamarkets/poly-websockets
+- Original Author: Konstantinos Lekkas
+- License: AGPL-3.0
+
 ## License
 
-AGPL-3
+AGPL-3.0
 
 ## Testing
 

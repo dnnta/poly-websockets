@@ -2,7 +2,7 @@ import util from 'util';
 import {
     WSSubscriptionManager as PolymarketStream,
     PolymarketPriceUpdateEvent,
-  } from '@nevuamarkets/poly-websockets';
+  } from '@ultralumao/poly-websockets';
   
   const markets: Map<string, string> = new Map();
   
